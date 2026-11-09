@@ -1,0 +1,112 @@
+//@version=6
+strategy("POWELL AI TRADER V3 | Powell vs Wickfery (prototype)", overlay=true, pyramiding=0, process_orders_on_close=true, initial_capital=50000, commission_type=strategy.commission.cash_per_contract, commission_value=2.50)
+
+// Educational prototype. Backtest with realistic costs; not a verified profitable system.
+// Run on a 2-minute NQ/MNQ chart. Times are America/New_York, DST-aware.
+mode = input.string("Powell 10 AM", "Strategy mode", options=["Powell 10 AM", "Wickfery"])
+requireMSS = input.bool(true, "Require structure shift confirmation")
+lookback = input.int(5, "Structure lookback bars", minval=2)
+wickRatio = input.float(0.45, "Min rejection wick / candle range", minval=0.1, maxval=0.9)
+stopBuffer = input.float(2.0, "Stop buffer (index points)", minval=0.0)
+rr = input.float(2.0, "Take profit (R multiple)", minval=0.5)
+maxTrades = input.int(2, "Maximum entries per day", minval=1)
+window = input.session("1000-1100", "Powell entry window (NY time)")
+asia = input.session("1900-0000", "Asia session (NY time)")
+london = input.session("0200-0930", "London reference session (NY time)")
+wickWindow = input.session("0930-1100", "Wickfery test window (NY time)")
+tz = "America/New_York"
+inAsia = not na(time(timeframe.period, asia, tz))
+inLondon = not na(time(timeframe.period, london, tz))
+inPowell = not na(time(timeframe.period, window, tz))
+inWick = not na(time(timeframe.period, wickWindow, tz))
+newAsia = inAsia and not inAsia[1]
+newLondon = inLondon and not inLondon[1]
+newDay = dayofmonth(time, tz) != dayofmonth(time[1], tz)
+var float asiaHigh = na
+var float asiaLow = na
+var float londonHigh = na
+var float londonLow = na
+var float keyOpen = na
+var int tradesToday = 0
+if newDay
+    tradesToday := 0
+    keyOpen := na
+if newAsia
+    asiaHigh := high
+    asiaLow := low
+else if inAsia
+    asiaHigh := math.max(nz(asiaHigh, high), high)
+    asiaLow := math.min(nz(asiaLow, low), low)
+if newLondon
+    londonHigh := high
+    londonLow := low
+else if inLondon
+    londonHigh := math.max(nz(londonHigh, high), high)
+    londonLow := math.min(nz(londonLow, low), low)
+if inPowell and not inPowell[1]
+    keyOpen := open
+plot(asiaHigh, "Asia high", color=color.new(color.yellow, 25), style=plot.style_stepline)
+plot(asiaLow, "Asia low", color=color.new(color.yellow, 25), style=plot.style_stepline)
+plot(londonHigh, "London high", color=color.new(color.aqua, 20), style=plot.style_stepline)
+plot(londonLow, "London low", color=color.new(color.aqua, 20), style=plot.style_stepline)
+plot(keyOpen, "10 AM key open", color=color.orange, linewidth=2, style=plot.style_stepline)
+
+// Sweeps must occur AFTER London reference session; never compare a bar to a high it is updating.
+sweepHigh = not inLondon and not na(londonHigh) and high > londonHigh and close < londonHigh
+sweepLow = not inLondon and not na(londonLow) and low < londonLow and close > londonLow
+bearWick = (high - math.max(open, close)) / math.max(high-low, syminfo.mintick) >= wickRatio
+bullWick = (math.min(open, close)-low) / math.max(high-low, syminfo.mintick) >= wickRatio
+// Three-candle FVG formed on previous closed bars, avoiding current-bar lookahead.
+bearFVG = high[1] < low[3]
+bullFVG = low[1] > high[3]
+recentBearFVG = ta.barssince(bearFVG) <= 12
+recentBullFVG = ta.barssince(bullFVG) <= 12
+// Simple, explicitly defined structure shift proxy (not discretionary ICT MSS).
+bearMSS = close < ta.lowest(low, lookback)[1]
+bullMSS = close > ta.highest(high, lookback)[1]
+var int pendingDirection = 0
+var float pendingStop = na
+var int pendingBar = na
+if newDay
+    pendingDirection := 0
+    pendingStop := na
+    pendingBar := na
+// Powell: sweep of London levels during the 10 AM window.
+// Wickfery: same sweep + recent FVG + rejection wick; definitions are approximations.
+powellShort = inPowell and sweepHigh and not na(keyOpen)
+powellLong = inPowell and sweepLow and not na(keyOpen)
+wickShort = inWick and sweepHigh and bearWick and recentBearFVG
+wickLong = inWick and sweepLow and bullWick and recentBullFVG
+setupShort = mode == "Powell 10 AM" ? powellShort : wickShort
+setupLong = mode == "Powell 10 AM" ? powellLong : wickLong
+if barstate.isconfirmed and setupShort
+    pendingDirection := -1
+    pendingStop := high + stopBuffer
+    pendingBar := bar_index
+if barstate.isconfirmed and setupLong
+    pendingDirection := 1
+    pendingStop := low - stopBuffer
+    pendingBar := bar_index
+// Confirm within 6 bars; do not use information from future bars.
+validPending = not na(pendingBar) and bar_index - pendingBar <= 6
+allowed = (mode == "Powell 10 AM" ? inPowell : inWick) and tradesToday < maxTrades and strategy.position_size == 0
+shortSignal = barstate.isconfirmed and allowed and validPending and pendingDirection == -1 and (not requireMSS or bearMSS)
+longSignal = barstate.isconfirmed and allowed and validPending and pendingDirection == 1 and (not requireMSS or bullMSS)
+if shortSignal and pendingStop > close
+    risk = pendingStop - close
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short exit", "Short", stop=pendingStop, limit=close-risk*rr)
+    tradesToday += 1
+    pendingDirection := 0
+if longSignal and pendingStop < close
+    risk = close - pendingStop
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long exit", "Long", stop=pendingStop, limit=close+risk*rr)
+    tradesToday += 1
+    pendingDirection := 0
+if not validPending
+    pendingDirection := 0
+plotshape(shortSignal, title="SELL candidate", text="SELL", style=shape.labeldown, color=color.red, textcolor=color.white, location=location.abovebar, size=size.tiny)
+plotshape(longSignal, title="BUY candidate", text="BUY", style=shape.labelup, color=color.green, textcolor=color.white, location=location.belowbar, size=size.tiny)
+alertcondition(longSignal, "BUY candidate", "Powell V3 BUY candidate on {{ticker}}")
+alertcondition(shortSignal, "SELL candidate", "Powell V3 SELL candidate on {{ticker}}")
